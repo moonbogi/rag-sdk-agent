@@ -1,0 +1,77 @@
+name: Retrieval Quality Gate
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  eval:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Restore cached eval pages + index
+        uses: actions/cache@v4
+        with:
+          path: |
+            _eval_pages.pkl
+            sdk_index.pkl
+          key: eval-corpus-v1
+
+      - name: Build eval index (if not cached)
+        run: |
+          if [ ! -f _eval_pages.pkl ]; then
+            echo "No cached pages found — crawling Spotify docs..."
+            python ingest_url.py https://developer.spotify.com/documentation/ios \
+              --no-filter --max-pages 150
+          else
+            echo "Using cached corpus"
+            python ingest_url.py https://developer.spotify.com/documentation/ios \
+              --no-filter --max-pages 150
+          fi
+
+      - name: Run retrieval eval
+        run: |
+          python eval.py --quick --output ci_results.csv
+          cat ci_results.csv
+
+      - name: Check MRR gate (must be >= 0.45)
+        run: |
+          python - <<'EOF'
+          import csv, sys
+
+          MRR_THRESHOLD = 0.45
+
+          with open("ci_results.csv") as f:
+              rows = list(csv.DictReader(f))
+
+          # Use K=8 row as the gate metric
+          row = next((r for r in rows if r["top_k"] == "8"), rows[0])
+          mrr = float(row["mrr"])
+          print(f"MRR @ K=8: {mrr:.3f}  (threshold: {MRR_THRESHOLD})")
+
+          if mrr < MRR_THRESHOLD:
+              print(f"FAIL — MRR {mrr:.3f} is below threshold {MRR_THRESHOLD}")
+              sys.exit(1)
+          else:
+              print(f"PASS — MRR {mrr:.3f} >= {MRR_THRESHOLD}")
+          EOF
+
+      - name: Upload eval results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: eval-results
+          path: ci_results.csv
