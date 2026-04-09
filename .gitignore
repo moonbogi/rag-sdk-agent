@@ -1,0 +1,9 @@
+venv/
+__pycache__/
+*.pkl
+*.csv
+*.pyc
+.env
+_eval_pages.pkl
+resume_snippet.tex
+.claude/
