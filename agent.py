@@ -23,10 +23,12 @@ from sentence_transformers import SentenceTransformer
 import anthropic
 import db
 
-INDEX_PATH   = "sdk_index.pkl"
-EMBED_MODEL  = "all-MiniLM-L6-v2"
-TOP_K        = 8
-CLAUDE_MODEL = "claude-sonnet-4-6"
+INDEX_PATH      = "sdk_index.pkl"
+EMBED_MODEL     = "all-MiniLM-L6-v2"
+RERANK_MODEL    = "cross-encoder/ms-marco-MiniLM-L-6-v2"  # ~67 MB
+TOP_K           = 8
+RERANK_FACTOR   = 2   # retrieve TOP_K * RERANK_FACTOR candidates, re-rank to TOP_K
+CLAUDE_MODEL    = "claude-sonnet-4-6"
 
 SYSTEM_PROMPT = """\
 You are a senior iOS Swift engineer who specialises in SDK integrations.
@@ -75,14 +77,27 @@ class GenerationResult:
     output_tokens: int = 0
 
 
-def retrieve(query: str, top_k: int = TOP_K) -> tuple[list[RetrievedChunk], float]:
-    """Returns (chunks, latency_ms)."""
-    t0    = time.perf_counter()
-    model = SentenceTransformer(EMBED_MODEL)
-    q_emb = model.encode([query], normalize_embeddings=True)[0]
+def _rerank(query: str, chunks: list[RetrievedChunk], top_k: int) -> tuple[list[RetrievedChunk], float]:
+    """Cross-encoder re-ranking — scores every (query, chunk) pair and returns top_k."""
+    from sentence_transformers import CrossEncoder
+    t0      = time.perf_counter()
+    model   = CrossEncoder(RERANK_MODEL)
+    pairs   = [(query, c.text) for c in chunks]
+    scores  = model.predict(pairs)
+    ranked  = sorted(zip(scores, chunks), key=lambda x: x[0], reverse=True)
+    result  = [c for _, c in ranked[:top_k]]
+    return result, (time.perf_counter() - t0) * 1000
+
+
+def retrieve(query: str, top_k: int = TOP_K, rerank: bool = True) -> tuple[list[RetrievedChunk], float]:
+    """Returns (chunks, latency_ms). Fetches top_k * RERANK_FACTOR candidates then re-ranks."""
+    t0         = time.perf_counter()
+    candidates = top_k * RERANK_FACTOR if rerank else top_k
+    model      = SentenceTransformer(EMBED_MODEL)
+    q_emb      = model.encode([query], normalize_embeddings=True)[0]
 
     if db.using_postgres():
-        results = db.similarity_search(q_emb, top_k)
+        results = db.similarity_search(q_emb, candidates)
         chunks  = [
             RetrievedChunk(text=r["text"], source=r["source"],
                            page=r["page"], score=r["score"])
@@ -94,17 +109,24 @@ def retrieve(query: str, top_k: int = TOP_K) -> tuple[list[RetrievedChunk], floa
         with open(INDEX_PATH, "rb") as f:
             index = pickle.load(f)
         scores  = index["embeddings"] @ q_emb
-        top_idx = np.argsort(scores)[::-1][:top_k]
+        top_idx = np.argsort(scores)[::-1][:candidates]
         chunks  = [
             RetrievedChunk(text=index["chunks"][i]["text"], source=index["chunks"][i]["source"],
                            page=index["chunks"][i]["page"], score=float(scores[i]))
             for i in top_idx
         ]
 
-    return chunks, (time.perf_counter() - t0) * 1000
+    embed_ms = (time.perf_counter() - t0) * 1000
+
+    if rerank and len(chunks) > top_k:
+        chunks, rerank_ms = _rerank(query, chunks, top_k)
+        return chunks, embed_ms + rerank_ms
+
+    return chunks, embed_ms
 
 
-def generate_swift_code(query: str, use_swiftui: bool = True, top_k: int = TOP_K) -> GenerationResult:
+def generate_swift_code(query: str, use_swiftui: bool = True, top_k: int = TOP_K,
+                        rerank: bool = True) -> GenerationResult:
     framework = "SwiftUI" if use_swiftui else "UIKit"
     langfuse  = _get_langfuse()
 
@@ -113,13 +135,13 @@ def generate_swift_code(query: str, use_swiftui: bool = True, top_k: int = TOP_K
     if langfuse:
         trace = langfuse.trace(
             name   = "generate_swift_code",
-            input  = {"query": query, "framework": framework, "top_k": top_k},
+            input  = {"query": query, "framework": framework, "top_k": top_k, "rerank": rerank},
             tags   = ["rag", "swift-codegen"],
         )
 
     # ── Retrieval ─────────────────────────────────────────────────────────────
-    print(f"\n[agent] Retrieving top {top_k} chunks ...")
-    chunks, retrieve_ms = retrieve(query, top_k=top_k)
+    print(f"\n[agent] Retrieving top {top_k} chunks (rerank={rerank}) ...")
+    chunks, retrieve_ms = retrieve(query, top_k=top_k, rerank=rerank)
     for c in chunks:
         print(f"  {c.score:.3f}  {c.source} p.{c.page}")
 
@@ -132,6 +154,8 @@ def generate_swift_code(query: str, use_swiftui: bool = True, top_k: int = TOP_K
                       for c in chunks],
             metadata = {"latency_ms": round(retrieve_ms, 1),
                         "embed_model": EMBED_MODEL,
+                        "rerank_model": RERANK_MODEL if rerank else None,
+                        "rerank_factor": RERANK_FACTOR if rerank else None,
                         "backend": "postgres" if db.using_postgres() else "pickle"},
         )
 
